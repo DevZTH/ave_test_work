@@ -1,0 +1,57 @@
+services:
+  redis:
+    image: redis:alpine3.22
+    container_name: phone_address_redis
+    restart: unless-stopped
+    
+    ports:
+      - "6379:6379"
+    env_file:
+      - ./.env
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - phone_network
+
+  app:
+    build: .
+    container_name: phone_address_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - phone_network
+
+
+  # Опционально: Redis Commander distroless 28mb
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: redis_commander
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    env_file:
+      - ./.env
+    depends_on:
+      - redis
+    networks:
+      - phone_network
+
+networks:
+  phone_network:
+    driver: bridge
+
+volumes:
+  redis_data:
