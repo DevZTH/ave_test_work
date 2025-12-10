@@ -2,9 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from pydantic_extra_types.phone_numbers import PhoneNumber
-from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 from os import getenv
 
+# Pараметры подключения к Redis из переменных окружения с дефолтными значениями для локальной отладки
 REDIS_HOST = getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(getenv("REDIS_PORT", 6379))
 REDIS_USERNAME = getenv("REDIS_USERNAME", "default")
@@ -28,13 +29,15 @@ class CustomerAddr(BaseModel):
     phone: PhoneNumber = Field(
         description="E.164 formatted phone number", example="+447911123456")
 
-    # Тема с адресами обширная и довольно скользкая. Можно использовать готовые библиотеки для парсинга адресов, но они могут не покрывать все случаи.
+    # Тема с адресами обширная и довольно скользкая.
+    # Можно использовать готовые библиотеки для парсинга адресов, но они могут не покрывать все случаи.
     # а для серввиса доставки вообще хорошо бы хранить геометку, но это уже выходит за рамки текущего задания.
     # Так что ограничусь строкой с валидацией по минимальной и максимальной длине.
     address: str = Field(min_length=10, max_length=255,
                          description="Full postal address", example="г. Белгород, ул. Щорса, 123")
 
 
+# Унифицированый ответ системы для операций создания, обновления, удаления
 class SystemResponse(BaseModel):
     """Стандартный ответ системы для операций создания, обновления, удаления"""
     detail: str
@@ -42,36 +45,40 @@ class SystemResponse(BaseModel):
     customer_addr: CustomerAddr | None = None
 
 
-class RedisWrapper(Redis):
+class RedisWrapper(AsyncRedis):
     """Расширение Redis клиента CRUD для CustomerAddr"""
     # выбран вариант хранения без избыточного хранения структуры, т.е. ключ - номер телефона, значение - строка адреса
 
     def __init__(self, *args, **kwargs):
+        # decode_responses=True для автоматического декодирования строк из байт
         super().__init__(*args, **kwargs, decode_responses=True)
 
-    def get(self, phone: PhoneNumber):
+    # Тут можно было бы прикрутить кеширование запросов но тогда потеряется возможность легко горизонтально масштабировать
+    async def get(self, phone: PhoneNumber):
         key = str(phone)
-        data = super().get(key)
+        data = await super().get(key)
         if data is not None:
-            return CustomerAddr(phone=phone, address=data)
-        raise False
+            # keep same return shape as the test mock (dict)
+            return {"phone": key, "address": data}
+        return None
 
-    def create(self, customer_addr: CustomerAddr) -> bool:
+    async def create(self, customer_addr: CustomerAddr) -> bool:
         key = str(customer_addr.phone)
-        if super().set(key, customer_addr.address.encode('UTF-8'), nx=True):
+        # set returns True if created
+        if await super().set(key, customer_addr.address, nx=True):
             return True
         return False
 
-    def update(self, customer_addr: CustomerAddr) -> bool:
+    async def update(self, customer_addr: CustomerAddr) -> bool:
         key = str(customer_addr.phone)
-        if super().set(key, customer_addr.address.encode('UTF-8'), xx=True):
+        if await super().set(key, customer_addr.address, xx=True):
             return True
         return False
 
-    def delete(self, phone: PhoneNumber) -> bool:
+    async def delete(self, phone: PhoneNumber) -> bool:
         key = str(phone)
         try:
-            return super().delete(key) > 0
+            return await super().delete(key) > 0
         except Exception:
             return False
 
@@ -84,7 +91,7 @@ redis_client = RedisWrapper(host=REDIS_HOST, username=REDIS_USERNAME,
          description="Возвращает адрес клиента по телефонному номеру.",
          responses={404: {}, })
 async def get_address_by_phone(phone: PhoneNumber) -> CustomerAddr:
-    result = redis_client.get(phone)
+    result = await redis_client.get(phone)
     if result is not None:
         return CustomerAddr(phone=phone, address=result["address"])
     raise HTTPException(status_code=404, detail="Phone number not found.")
@@ -94,7 +101,7 @@ async def get_address_by_phone(phone: PhoneNumber) -> CustomerAddr:
           description="Создать запись адреса для для телефонного номера.",
           responses={409: {}, })
 async def create_address_by_phone(data: CustomerAddr, response: Response) -> SystemResponse:
-    result = redis_client.create(data)
+    result = await redis_client.create(data)
     if result:
         return SystemResponse(detail="Created", customer_addr=data)
     else:
@@ -102,11 +109,12 @@ async def create_address_by_phone(data: CustomerAddr, response: Response) -> Sys
         return SystemResponse(detail="conflict: phone already exists", customer_addr=data)
 
 
+# Выбран метод PUT, т.к. документация fastapi рекомендует его использвание.
 @app.put(ENDPOINT_PREFIX, response_model=SystemResponse,
          description="Обновить адрес для указанного телефонного номера.",
          responses={404: {}, })
 async def update_address_by_phone(data: CustomerAddr, response: Response) -> SystemResponse:
-    result = redis_client.update(data, )
+    result = await redis_client.update(data, )
     if result:
         return SystemResponse(detail="Updated", customer_addr=data)
 
@@ -118,7 +126,7 @@ async def update_address_by_phone(data: CustomerAddr, response: Response) -> Sys
             description="Удалить запись адреса для телефонного номера.",
             responses={404: {}, })
 async def delete_address_by_phone(phone: PhoneNumber):
-    result = redis_client.delete(phone)
+    result = await redis_client.delete(phone)
     if result:
         return
     raise HTTPException(status_code=404, detail="Phone number not found.")
